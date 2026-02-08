@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Post Operation - Auto Repost
 // @namespace    https://github.com/myhomeayu/post_op
-// @version      1.0.1
+// @version      1.0.2
 // @description  X(Twitter)のポストに「リポスト」が含まれていれば、通常リポストを実行する
 // @author       myhomeayu
 // @match        https://x.com/*/status/*
@@ -131,6 +131,13 @@ function isAlreadyProcessed(statusId) {
 function markAsProcessed(statusId) {
   const key = `post_op_processed_${statusId}`;
   sessionStorage.setItem(key, 'true');
+  log(`[処理済み] statusId=${statusId} をマーク（成功確定）`);
+}
+
+function unmarkAsProcessed(statusId) {
+  const key = `post_op_processed_${statusId}`;
+  sessionStorage.removeItem(key);
+  log(`[処理済み] statusId=${statusId} をアンマーク（失敗対応）`);
 }
 
 // ============================================================================
@@ -285,9 +292,10 @@ function findMenuItemInContainer(menuContainer, actionKey) {
 /**
  * アクション実行（メニュー選択 → 確定ボタンまで）
  * @param {string} actionKey - REPOST / QUOTE など
+ * @param {string} statusId - ポストID（処理済みマークで使用）
  * @returns {Promise<boolean>}
  */
-async function executeAction(actionKey) {
+async function executeAction(actionKey, statusId) {
   const action = ACTIONS[actionKey];
   if (!action || !action.enabled) {
     log(`[実行] アクション「${actionKey}」は無効または存在しません`);
@@ -373,9 +381,17 @@ async function executeAction(actionKey) {
     }
   } else {
     log(`[実行] 確定ボタンなし（メニュー選択のみで完了）`);
+    // 確定ボタンが不要な場合、ここで処理済みをマーク
+    if (statusId) {
+      markAsProcessed(statusId);
+    }
   }
 
   log(`[実行] アクション「${action.label}」完了`);
+  // 確定ボタンがあって成功した場合、ここで処理済みをマーク
+  if (confirmButton && statusId) {
+    markAsProcessed(statusId);
+  }
   return true;
 }
 
@@ -488,12 +504,11 @@ async function processPost() {
 
   log(`ステータスID: ${statusId}`);
 
-  // 多重実行防止：早期にフラグを立てる
+  // 多重実行防止：既に処理済みかチェック
   if (isAlreadyProcessed(statusId)) {
-    log('スキップ: 既に処理済み');
+    log('[スキップ] 既に処理済みポスト');
     return;
   }
-  markAsProcessed(statusId);
 
   // レート制限チェック
   if (!checkRateLimit()) {
@@ -515,21 +530,28 @@ async function processPost() {
     return;
   }
 
-  // リポストボタンをクリック
-  log('リポスト処理開始');
-  const buttonClicked = await clickRepostButton();
-  if (!buttonClicked) {
-    log('リポスト失敗: リポストボタンクリック失敗');
-    return;
-  }
+  // リポスト処理：try/finallyで失敗時の自動解除を保証
+  try {
+    log('[実行] リポスト処理開始');
+    const buttonClicked = await clickRepostButton();
+    if (!buttonClicked) {
+      log('[失敗] リポストボタンクリック失敗');
+      return;
+    }
 
-  // アクション実行（メニュー選択 → 確定ボタンまで）
-  const success = await executeAction(actionKey);
+    // アクション実行（メニュー選択 → 確定ボタンまで）
+    const success = await executeAction(actionKey, statusId);
 
-  if (success) {
-    log('リポスト完了');
-  } else {
-    log('リポスト失敗: アクション実行失敗');
+    if (success) {
+      log('[完了] リポスト完了（処理済みをマーク）');
+      // ※ executeAction() 内で markAsProcessed() 呼び出し済み
+    } else {
+      log('[失敗] アクション実行失敗（自動解除を実行）');
+      unmarkAsProcessed(statusId);
+    }
+  } catch (e) {
+    log(`[エラー] 予期しないエラー: ${e.message}（自動解除を実行）`);
+    unmarkAsProcessed(statusId);
   }
 }
 
@@ -621,6 +643,45 @@ function init() {
       log('初期処理中エラー:', e.message);
     });
   }, 1000);
+}
+
+// ============================================================================
+// デバッグ・管理コマンド
+// ============================================================================
+
+/**
+ * 指定ポストの処理済みフラグを解除
+ * @param {string} statusId - ポストID
+ */
+function clearProcessedFlag(statusId) {
+  if (!statusId) {
+    statusId = getCurrentStatusId();
+  }
+  if (statusId) {
+    unmarkAsProcessed(statusId);
+    alert(`ポスト ${statusId} の処理済みフラグを解除しました`);
+  }
+}
+
+/**
+ * 全ての処理済みフラグをクリア
+ */
+function clearAllProcessedFlags() {
+  const keysToRemove = [];
+  for (let i = 0; i < sessionStorage.length; i++) {
+    const key = sessionStorage.key(i);
+    if (key && key.startsWith('post_op_processed_')) {
+      keysToRemove.push(key);
+    }
+  }
+
+  keysToRemove.forEach(key => {
+    sessionStorage.removeItem(key);
+    const statusId = key.replace('post_op_processed_', '');
+    log(`[管理] 処理済みクリア: ${statusId}`);
+  });
+
+  alert(`${keysToRemove.length} 件の処理済みフラグをクリアしました`);
 }
 
 // スクリプト開始
