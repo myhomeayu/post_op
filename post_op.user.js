@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Post Operation - Auto Repost
 // @namespace    https://github.com/myhomeayu/post_op
-// @version      1.0.0
+// @version      1.0.1
 // @description  X(Twitter)のポストに「リポスト」が含まれていれば、通常リポストを実行する
 // @author       myhomeayu
 // @match        https://x.com/*/status/*
@@ -31,6 +31,35 @@ const CONFIG = {
 
   // ポーリング間隔（要素検索）
   POLL_INTERVAL_MS: 100,
+
+  // メニュー出現待機時間
+  MENU_WAIT_TIMEOUT_MS: 5000,
+
+  // 確定ボタン待機時間
+  CONFIRM_WAIT_TIMEOUT_MS: 3000,
+};
+
+// ============================================================================
+// アクション定義テーブル（将来拡張に対応）
+// ============================================================================
+
+const ACTIONS = {
+  REPOST: {
+    key: 'REPOST',
+    keyword: 'リポスト',
+    enabled: true,  // 今回は実行
+    textPatterns: ['リポスト'],
+    excludePatterns: ['引用'],
+    label: '通常リポスト',
+  },
+  QUOTE: {
+    key: 'QUOTE',
+    keyword: '引用',
+    enabled: false, // 将来実装（現時点は無効）
+    textPatterns: ['引用する', '引用'],
+    excludePatterns: [],
+    label: '引用リポスト',
+  },
 };
 
 // ============================================================================
@@ -132,20 +161,271 @@ function extractPostContent() {
 // キーワード判定
 // ============================================================================
 
-function shouldRepost(postContent) {
-  if (!postContent) return false;
+function shouldExecuteAction(postContent) {
+  if (!postContent) return null;
 
-  // 「リポスト」キーワードを検索
-  const keyword = 'リポスト';
-  const found = postContent.includes(keyword);
+  // 有効なアクションを順に確認
+  for (const actionKey in ACTIONS) {
+    const action = ACTIONS[actionKey];
+    if (!action.enabled) continue;
 
-  log(`判定結果: 「${keyword}」 ${found ? '検出' : '未検出'}`);
+    // textPatterns マッチング
+    let matched = false;
+    for (const pattern of action.textPatterns) {
+      if (postContent.includes(pattern)) {
+        matched = true;
+        break;
+      }
+    }
 
-  return found;
+    if (!matched) continue;
+
+    // excludePatterns チェック
+    let excluded = false;
+    for (const pattern of action.excludePatterns) {
+      if (postContent.includes(pattern)) {
+        excluded = true;
+        break;
+      }
+    }
+
+    if (excluded) {
+      log(`判定結果: 「${action.keyword}」検出も除外パターンにより実行しない`);
+      continue;
+    }
+
+    log(`判定結果: アクション「${action.label}」を実行`);
+    return actionKey;
+  }
+
+  log('判定結果: 実行するアクションなし');
+  return null;
 }
 
 // ============================================================================
-// リポストボタン検索・クリック
+// メニュー項目探索と実行
+// ============================================================================
+
+/**
+ * メニュー要素内から対象アクション項目を探索
+ * @param {Element} menuContainer - メニューコンテナ要素
+ * @param {string} actionKey - REPOST / QUOTE など
+ * @returns {Element|null} - 見つかった要素、またはnull
+ */
+function findMenuItemInContainer(menuContainer, actionKey) {
+  if (!menuContainer) return null;
+
+  const action = ACTIONS[actionKey];
+  if (!action) return null;
+
+  // 候補セレクタ（優先順位）
+  const candidates = [];
+
+  // 1. data-testid で探索（最優先）
+  const testIdSelectors = [
+    `[data-testid*="${actionKey.toLowerCase()}"]`,
+    `[data-testid*="retweet"]`, // REPOST の場合
+  ];
+  for (const selector of testIdSelectors) {
+    const elem = menuContainer.querySelector(selector);
+    if (elem) {
+      log(`[メニュー探索] data-testid マッチ: ${selector}`);
+      candidates.push({ elem, reason: 'data-testid' });
+    }
+  }
+
+  // 2. role ベース（menuitem など）
+  if (candidates.length === 0) {
+    const roleElements = menuContainer.querySelectorAll('[role="menuitem"], [role="menuitemradio"], button');
+    for (const elem of roleElements) {
+      candidates.push({ elem, reason: 'role-based' });
+    }
+  }
+
+  // 3. テキストマッチング
+  if (candidates.length === 0) {
+    const allClickable = menuContainer.querySelectorAll('button, [role="menuitem"], [role="button"], a, div[tabindex]');
+    for (const elem of allClickable) {
+      const text = elem.innerText || elem.textContent || '';
+      // textPatterns にマッチしたら候補に追加
+      for (const pattern of action.textPatterns) {
+        if (text.includes(pattern)) {
+          candidates.push({ elem, reason: 'text-match', pattern });
+          break;
+        }
+      }
+    }
+  }
+
+  // 候補から最適なものを選択（テキスト一致優先）
+  for (const candidate of candidates) {
+    const elem = candidate.elem;
+    const text = elem.innerText || elem.textContent || '';
+
+    // excludePatterns チェック
+    let isValid = true;
+    for (const excludePattern of action.excludePatterns) {
+      if (text.includes(excludePattern)) {
+        isValid = false;
+        log(`[メニュー探索] 除外: "${text}" (含む: "${excludePattern}")`);
+        break;
+      }
+    }
+
+    if (isValid && text.trim().length > 0) {
+      log(`[メニュー探索] 決定: "${text}" (方式: ${candidate.reason})`);
+      return elem;
+    }
+  }
+
+  log('[メニュー探索] 該当要素が見つかりません');
+  return null;
+}
+
+/**
+ * アクション実行（メニュー選択 → 確定ボタンまで）
+ * @param {string} actionKey - REPOST / QUOTE など
+ * @returns {Promise<boolean>}
+ */
+async function executeAction(actionKey) {
+  const action = ACTIONS[actionKey];
+  if (!action || !action.enabled) {
+    log(`[実行] アクション「${actionKey}」は無効または存在しません`);
+    return false;
+  }
+
+  log(`[実行] アクション「${action.label}」の実行開始`);
+
+  // ランダム遅延
+  const delay = getRandomDelay();
+  log(`[実行] ランダム遅延: ${delay}ms`);
+  await sleep(delay);
+
+  // メニュー出現を待機
+  const menuContainer = await waitForElement('[role="menu"], div[role="dialog"]', CONFIG.MENU_WAIT_TIMEOUT_MS);
+  if (!menuContainer) {
+    log('[実行] メニューが出現しません（タイムアウト）');
+    return false;
+  }
+
+  log('[実行] メニューを検出');
+
+  // メニュー内から対象アクション項目を探索
+  const menuItem = findMenuItemInContainer(menuContainer, actionKey);
+  if (!menuItem) {
+    log(`[実行] メニュー内に「${action.label}」項目が見つかりません`);
+    return false;
+  }
+
+  // クリック前に無効状態をチェック
+  if (menuItem.disabled || menuItem.getAttribute('aria-disabled') === 'true') {
+    log(`[実行] メニュー項目が無効状態です`);
+    return false;
+  }
+
+  // 視界に入れる
+  try {
+    menuItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) {
+    log(`[実行] scrollIntoView 失敗: ${e.message}`);
+  }
+
+  // クリック実行
+  log(`[実行] メニュー項目をクリック`);
+  await sleep(getRandomDelay());
+
+  try {
+    menuItem.click();
+  } catch (e) {
+    log(`[実行] click() 失敗: ${e.message}、MouseEvent フォールバック試行`);
+    const mouseEvent = new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    });
+    try {
+      menuItem.dispatchEvent(mouseEvent);
+    } catch (e2) {
+      log(`[実行] MouseEvent 失敗: ${e2.message}`);
+      return false;
+    }
+  }
+
+  // 確定ボタン待機（2段階確定対応）
+  await sleep(500);
+  const confirmButton = await findConfirmButton(action.label, CONFIG.CONFIRM_WAIT_TIMEOUT_MS);
+
+  if (confirmButton) {
+    log(`[実行] 確定ボタン検出`);
+    await sleep(getRandomDelay());
+
+    if (confirmButton.disabled || confirmButton.getAttribute('aria-disabled') === 'true') {
+      log(`[実行] 確定ボタンが無効状態です`);
+      return false;
+    }
+
+    try {
+      confirmButton.click();
+      log(`[実行] 確定ボタンクリック`);
+    } catch (e) {
+      log(`[実行] 確定クリック失敗: ${e.message}`);
+      return false;
+    }
+  } else {
+    log(`[実行] 確定ボタンなし（メニュー選択のみで完了）`);
+  }
+
+  log(`[実行] アクション「${action.label}」完了`);
+  return true;
+}
+
+/**
+ * 確定ボタンを探索（data-testid → role → テキストの優先順位）
+ * @param {string} actionLabel - アクション名
+ * @param {number} timeoutMs - タイムアウト
+ * @returns {Promise<Element|null>}
+ */
+async function findConfirmButton(actionLabel, timeoutMs) {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeoutMs) {
+    // data-testid で探索
+    let button = document.querySelector('[data-testid="confirmButton"]') ||
+                 document.querySelector('[data-testid*="confirm"]');
+    if (button) {
+      log(`[確定ボタン] data-testid マッチ`);
+      return button;
+    }
+
+    // role で探索
+    button = document.querySelector('[role="button"][aria-label*="確定"]') ||
+             document.querySelector('button[aria-label*="確定"]');
+    if (button) {
+      log(`[確定ボタン] role/aria-label マッチ`);
+      return button;
+    }
+
+    // テキストマッチング
+    const buttons = document.querySelectorAll('button');
+    for (const btn of buttons) {
+      const text = btn.innerText || btn.textContent || '';
+      if ((text.includes('確定') || text.includes('リポスト')) && !text.includes('キャンセル')) {
+        if (!btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
+          log(`[確定ボタン] テキストマッチ: "${text}"`);
+          return btn;
+        }
+      }
+    }
+
+    await sleep(CONFIG.POLL_INTERVAL_MS);
+  }
+
+  log(`[確定ボタン] 見つかりません（タイムアウト）`);
+  return null;
+}
+
+// ============================================================================
+// ボタンクリック・要素探索ユーティリティ
 // ============================================================================
 
 async function waitForElement(selector, timeoutMs) {
@@ -162,83 +442,36 @@ async function waitForElement(selector, timeoutMs) {
   return null;
 }
 
-async function findAndClickRepostButton() {
-  // リポストボタンをdata-testidで検索
-  // X（Twitter）のリポストボタンは data-testid="retweet" のようなIDを持つ
+/**
+ * リポストボタン（初期トリガー）を探索・クリック
+ * @returns {Promise<boolean>}
+ */
+async function clickRepostButton() {
   const repostButton = document.querySelector('[aria-label*="リポスト"]') ||
                        document.querySelector('[aria-label*="Retweet"]') ||
                        document.querySelector('[data-testid="retweet"]');
 
   if (!repostButton) {
-    log('リポストボタンが見つかりません');
+    log('[初期] リポストボタンが見つかりません');
     return false;
   }
 
-  log('リポストボタンを検出');
+  log('[初期] リポストボタンを検出');
 
   // ランダム遅延
   const delay = getRandomDelay();
-  log(`ランダム遅延: ${delay}ms`);
+  log(`[初期] ランダム遅延: ${delay}ms`);
   await sleep(delay);
 
   // ボタンをクリック
   try {
     repostButton.click();
-    log('リポストボタンをクリック');
+    log('[初期] リポストボタンをクリック');
+    return true;
   } catch (e) {
-    log('クリック失敗:', e.message);
+    log(`[初期] クリック失敗: ${e.message}`);
     return false;
   }
-
-  // メニューが出現する場合の対応
-  await sleep(500);
-
-  // 引用ではない「リポスト」を選択
-  const repostMenuItems = Array.from(document.querySelectorAll('[role="menuitem"]'));
-  let repostMenuItem = null;
-
-  for (const item of repostMenuItems) {
-    const text = item.innerText || item.textContent || '';
-    // 「リポスト」単体で、「引用」を含まないもの
-    if (text.includes('リポスト') && !text.includes('引用')) {
-      repostMenuItem = item;
-      break;
-    }
-  }
-
-  if (repostMenuItem) {
-    log('リポストメニュー選択');
-    await sleep(getRandomDelay());
-    try {
-      repostMenuItem.click();
-    } catch (e) {
-      log('メニュークリック失敗:', e.message);
-      return false;
-    }
-  } else {
-    // メニューが出ない場合、そのまま完了と判定
-    log('メニューなし（直接実行）');
-  }
-
-  // 確認ダイアログ対応（タイムアウト付き）
-  const confirmButton = await waitForElement(
-    'button[aria-label*="リポスト"], button[aria-label*="Retweet"]',
-    3000
-  );
-
-  if (confirmButton) {
-    log('確認ボタン検出');
-    await sleep(getRandomDelay());
-    try {
-      confirmButton.click();
-      log('確認ボタンクリック');
-    } catch (e) {
-      log('確認クリック失敗:', e.message);
-      return false;
-    }
-  }
-
-  return true;
 }
 
 // ============================================================================
@@ -275,20 +508,28 @@ async function processPost() {
     return;
   }
 
-  // キーワード判定
-  if (!shouldRepost(postContent)) {
-    log('スキップ: キーワード未検出');
+  // 実行するアクション判定
+  const actionKey = shouldExecuteAction(postContent);
+  if (!actionKey) {
+    log('スキップ: 実行するアクションなし');
     return;
   }
 
-  // リポスト実行
-  log('リポスト実行開始');
-  const success = await findAndClickRepostButton();
+  // リポストボタンをクリック
+  log('リポスト処理開始');
+  const buttonClicked = await clickRepostButton();
+  if (!buttonClicked) {
+    log('リポスト失敗: リポストボタンクリック失敗');
+    return;
+  }
+
+  // アクション実行（メニュー選択 → 確定ボタンまで）
+  const success = await executeAction(actionKey);
 
   if (success) {
     log('リポスト完了');
   } else {
-    log('リポスト失敗');
+    log('リポスト失敗: アクション実行失敗');
   }
 }
 
