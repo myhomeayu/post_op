@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Post Operation - Auto Repost
 // @namespace    https://github.com/myhomeayu/post_op
-// @version      1.0.2
+// @version      1.0.3
 // @description  X(Twitter)のポストに「リポスト」が含まれていれば、通常リポストを実行する
 // @author       myhomeayu
 // @match        https://x.com/*/status/*
@@ -78,6 +78,46 @@ function sleep(ms) {
 
 function getRandomDelay() {
   return Math.floor(Math.random() * (CONFIG.DELAY_MAX - CONFIG.DELAY_MIN + 1)) + CONFIG.DELAY_MIN;
+}
+
+// ============================================================================
+// クリック補助ユーティリティ
+// ============================================================================
+
+function robustClick(elem) {
+  if (!elem) return false;
+  try {
+    elem.scrollIntoView({ block: 'center', inline: 'center' });
+  } catch (e) {
+    // ignore
+  }
+
+  try {
+    elem.click();
+    return true;
+  } catch (e) {
+    // fallback: dispatch pointer/mouse events with center coordinates
+    try {
+      const rect = elem.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+
+      const events = ['pointerdown','pointerup','mousedown','mouseup','click'];
+      for (const type of events) {
+        const ev = new MouseEvent(type, {
+          view: window,
+          bubbles: true,
+          cancelable: true,
+          clientX: Math.round(cx),
+          clientY: Math.round(cy)
+        });
+        elem.dispatchEvent(ev);
+      }
+      return true;
+    } catch (e2) {
+      return false;
+    }
+  }
 }
 
 function getCurrentStatusId() {
@@ -317,7 +357,43 @@ async function executeAction(actionKey, statusId) {
   log(`[実行] ランダム遅延: ${delay}ms`);
   await sleep(delay);
 
-  // メニュー出現を待機
+  // REPOST の最優先処理：retweetConfirm を直接待機してクリック
+  if (actionKey === 'REPOST') {
+    log('[実行] REPOST: retweetConfirm を優先待機');
+    const directConfirm = await waitForElement('[data-testid="retweetConfirm"]', CONFIG.MENU_WAIT_TIMEOUT_MS);
+    if (directConfirm) {
+      log('[実行] retweetConfirm を検出');
+      await sleep(getRandomDelay());
+      const clicked = robustClick(directConfirm);
+      log('[実行] retweetConfirm クリック試行', clicked);
+
+      if (!clicked) {
+        log('[実行] retweetConfirm クリック失敗、フォールバックへ');
+        // fallthrough to menu-based handling
+      } else {
+        // 確実性のため、リポスト状態に変わったか確認
+        const startTime = Date.now();
+        let reposted = false;
+        while (Date.now() - startTime < CONFIG.CONFIRM_WAIT_TIMEOUT_MS) {
+          const rb = document.querySelector('[data-testid="retweet"], [aria-label*="リポスト"], [aria-label*="Retweet"]');
+          if (rb && rb.getAttribute && rb.getAttribute('aria-pressed') === 'true') {
+            reposted = true;
+            break;
+          }
+          await sleep(200);
+        }
+        log('[実行] retweetConfirm 後の再判定 isReposted=', reposted);
+        if (reposted && statusId) {
+          markAsProcessed(statusId);
+        }
+        return reposted;
+      }
+    } else {
+      log('[実行] retweetConfirm 未検出（フォールバックでメニュー探索へ）');
+    }
+  }
+
+  // メニュー出現を待機（フォールバック）
   const menuContainer = await waitForElement('[role="menu"], div[role="dialog"]', CONFIG.MENU_WAIT_TIMEOUT_MS);
   if (!menuContainer) {
     log('[実行] メニューが出現しません（タイムアウト）');
@@ -541,6 +617,18 @@ async function processPost() {
     return;
   }
   log('[検出] リポストボタンを検出');
+
+  // 追加安全策: 既にリポスト済みなら何もしない（aria-pressed）
+  try {
+    const pressed = repostButton.getAttribute && repostButton.getAttribute('aria-pressed');
+    if (pressed === 'true') {
+      log('[スキップ] 既にリポスト済み (aria-pressed=true)。処理済みフラグを立てます');
+      markAsProcessed(statusId);
+      return;
+    }
+  } catch (e) {
+    // ignore attribute read error
+  }
 
   // ★ ここまで来てから初めてレート制限をチェック ★
   if (!checkRateLimitPerPost(statusId)) {
