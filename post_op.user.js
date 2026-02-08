@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Post Operation - Auto Repost
 // @namespace    https://github.com/myhomeayu/post_op
-// @version      1.0.3
+// @version      1.0.4
 // @description  X(Twitter)のポストに「リポスト」が含まれていれば、通常リポストを実行する
 // @author       myhomeayu
 // @match        https://x.com/*/status/*
@@ -92,31 +92,40 @@ function robustClick(elem) {
     // ignore
   }
 
+  // dispatch pointer/mouse events with center coordinates
   try {
-    elem.click();
-    return true;
-  } catch (e) {
-    // fallback: dispatch pointer/mouse events with center coordinates
-    try {
-      const rect = elem.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2;
-      const cy = rect.top + rect.height / 2;
+    const rect = elem.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
 
-      const events = ['pointerdown','pointerup','mousedown','mouseup','click'];
-      for (const type of events) {
-        const ev = new MouseEvent(type, {
-          view: window,
-          bubbles: true,
-          cancelable: true,
-          clientX: Math.round(cx),
-          clientY: Math.round(cy)
+    const common = {
+      view: window,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      clientX: Math.round(cx),
+      clientY: Math.round(cy),
+      button: 0,
+      buttons: 1,
+    };
+
+    const pointerEvents = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+    for (const type of pointerEvents) {
+      if (type.startsWith('pointer') && window.PointerEvent) {
+        const ev = new PointerEvent(type, {
+          ...common,
+          pointerType: 'mouse',
+          isPrimary: true,
         });
         elem.dispatchEvent(ev);
+      } else {
+        const ev = new MouseEvent(type, common);
+        elem.dispatchEvent(ev);
       }
-      return true;
-    } catch (e2) {
-      return false;
     }
+    return true;
+  } catch (e2) {
+    return false;
   }
 }
 
@@ -258,6 +267,73 @@ function shouldExecuteAction(postContent) {
 }
 
 // ============================================================================
+// 対象ポスト特定（ルート要素）
+// ============================================================================
+
+/**
+ * 対象ポストのルート要素を特定（メイン投稿を優先）
+ * @param {string} statusId - ポストID
+ * @returns {Element|null}
+ */
+function findMainPostRoot(statusId) {
+  const articles = Array.from(document.querySelectorAll('article'));
+  let fallback = null;
+
+  for (const article of articles) {
+    const hasText = article.querySelector('[data-testid="tweetText"]');
+    if (!hasText) continue;
+
+    if (statusId) {
+      const link = article.querySelector(`a[href*="/status/${statusId}"]`);
+      if (link) {
+        log(`[検出] 対象ポストルートを特定 statusId=${statusId}`);
+        return article;
+      }
+    }
+
+    if (!fallback) {
+      fallback = article;
+    }
+  }
+
+  if (fallback) {
+    log(`[検出] 対象ポストルートを特定（フォールバック） statusId=${statusId}`);
+  } else {
+    log('[検出] 対象ポストルートが見つかりません');
+  }
+
+  return fallback;
+}
+
+/**
+ * 対象ポストルート内からリポストボタンを取得
+ * @param {Element} root - 対象ポストのルート要素
+ * @returns {{button: Element|null, selector: string|null}}
+ */
+function findRepostButtonInRoot(root) {
+  if (!root) return { button: null, selector: null };
+
+  const selectors = [
+    '[data-testid="retweet"]',
+    '[aria-label*="リポスト"]',
+    '[aria-label*="Retweet"]',
+    '[role="button"][aria-label*="リポスト"]',
+    '[role="button"][aria-label*="Retweet"]',
+  ];
+
+  for (const selector of selectors) {
+    const button = root.querySelector(selector);
+    if (button) {
+      log(`[検出] リポストボタンを取得: selector=${selector}`);
+      return { button, selector };
+    }
+  }
+
+  log('[検出] リポストボタンが見つかりません');
+  return { button: null, selector: null };
+}
+
+// ============================================================================
 // メニュー項目探索と実行
 // ============================================================================
 
@@ -360,7 +436,10 @@ async function executeAction(actionKey, statusId) {
   // REPOST の最優先処理：retweetConfirm を直接待機してクリック
   if (actionKey === 'REPOST') {
     log('[実行] REPOST: retweetConfirm を優先待機');
+    const confirmStart = Date.now();
     const directConfirm = await waitForElement('[data-testid="retweetConfirm"]', CONFIG.MENU_WAIT_TIMEOUT_MS);
+    const confirmWaited = Date.now() - confirmStart;
+    log(`[実行] retweetConfirm 待機結果: ${directConfirm ? '検出' : '未検出'} (${confirmWaited}ms)`);
     if (directConfirm) {
       log('[実行] retweetConfirm を検出');
       await sleep(getRandomDelay());
@@ -544,13 +623,10 @@ async function waitForElement(selector, timeoutMs) {
 
 /**
  * リポストボタン（初期トリガー）を探索・クリック
+ * @param {Element} repostButton - 対象ポスト内のリポストボタン
  * @returns {Promise<boolean>}
  */
-async function clickRepostButton() {
-  const repostButton = document.querySelector('[aria-label*="リポスト"]') ||
-                       document.querySelector('[aria-label*="Retweet"]') ||
-                       document.querySelector('[data-testid="retweet"]');
-
+async function clickRepostButton(repostButton) {
   if (!repostButton) {
     log('[初期] リポストボタンが見つかりません');
     return false;
@@ -563,15 +639,11 @@ async function clickRepostButton() {
   log(`[初期] ランダム遅延: ${delay}ms`);
   await sleep(delay);
 
-  // ボタンをクリック
-  try {
-    repostButton.click();
-    log('[初期] リポストボタンをクリック');
-    return true;
-  } catch (e) {
-    log(`[初期] クリック失敗: ${e.message}`);
-    return false;
-  }
+  // ボタンを強クリック（robustClick）
+  log('[初期] robustClick を実行');
+  const clicked = robustClick(repostButton);
+  log('[初期] robustClick 結果:', clicked);
+  return clicked;
 }
 
 // ============================================================================
@@ -608,20 +680,25 @@ async function processPost() {
     return;
   }
 
-  // リポストボタン検出（これ以上進む前に確認）
-  const repostButton = document.querySelector('[aria-label*="リポスト"]') ||
-                       document.querySelector('[aria-label*="Retweet"]') ||
-                       document.querySelector('[data-testid="retweet"]');
+  // 対象ポストルート特定
+  const postRoot = findMainPostRoot(statusId);
+  if (!postRoot) {
+    log('[スキップ] 対象ポストルートが見つかりません');
+    return;
+  }
+
+  // リポストボタン検出（対象ポスト内）
+  const { button: repostButton } = findRepostButtonInRoot(postRoot);
   if (!repostButton) {
     log('[スキップ] リポストボタンが見つかりません');
     return;
   }
-  log('[検出] リポストボタンを検出');
 
   // 追加安全策: 既にリポスト済みなら何もしない（aria-pressed）
   try {
     const pressed = repostButton.getAttribute && repostButton.getAttribute('aria-pressed');
-    if (pressed === 'true') {
+    const checked = repostButton.getAttribute && repostButton.getAttribute('aria-checked');
+    if (pressed === 'true' || checked === 'true') {
       log('[スキップ] 既にリポスト済み (aria-pressed=true)。処理済みフラグを立てます');
       markAsProcessed(statusId);
       return;
@@ -639,14 +716,38 @@ async function processPost() {
   // リポスト処理：try/finallyで失敗時の自動解除を保証
   try {
     log('[実行] リポスト処理開始');
-    const buttonClicked = await clickRepostButton();
-    if (!buttonClicked) {
-      log('[失敗] リポストボタンクリック失敗');
-      return;
-    }
+    let success = false;
+    let lastError = null;
 
-    // アクション実行（メニュー選択 → 確定ボタンまで）
-    const success = await executeAction(actionKey, statusId);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      log(`[実行] リポスト試行 ${attempt}/2`);
+      const buttonClicked = await clickRepostButton(repostButton);
+      if (!buttonClicked) {
+        lastError = 'リポストボタンクリック失敗';
+        log(`[失敗] ${lastError}`);
+        if (attempt < 2) {
+          const retryDelay = getRandomDelay();
+          log(`[再試行] ${retryDelay}ms 後に再試行`);
+          await sleep(retryDelay);
+          continue;
+        }
+        break;
+      }
+
+      // アクション実行（メニュー選択 → 確定ボタンまで）
+      success = await executeAction(actionKey, statusId);
+      if (success) {
+        break;
+      }
+
+      lastError = 'アクション実行失敗（retweetConfirm 未検出 or メニュー未検出）';
+      log(`[失敗] ${lastError}`);
+      if (attempt < 2) {
+        const retryDelay = getRandomDelay();
+        log(`[再試行] ${retryDelay}ms 後に再試行`);
+        await sleep(retryDelay);
+      }
+    }
 
     if (success) {
       log('[完了] リポスト完了（処理済みをマーク）');
@@ -654,7 +755,7 @@ async function processPost() {
       // ★ 成功時のみレート制限実行記録を残す ★
       recordRateLimitExecution(statusId);
     } else {
-      log('[失敗] アクション実行失敗（自動解除を実行）');
+      log(`[失敗] 最終失敗: ${lastError}（自動解除を実行）`);
       unmarkAsProcessed(statusId);
     }
   } catch (e) {
