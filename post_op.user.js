@@ -5,7 +5,7 @@
 // @description  X(Twitter)のポストに「リポスト」が含まれていれば、通常リポストを実行する
 // @author       myhomeayu
 // @match        https://x.com/*/status/*
-// @grant        none
+// @grant        GM_registerMenuCommand
 // @downloadURL  https://github.com/myhomeayu/post_op/raw/main/post_op.user.js
 // @updateURL    https://github.com/myhomeayu/post_op/raw/main/post_op.user.js
 // ==/UserScript==
@@ -86,37 +86,45 @@ function getCurrentStatusId() {
 }
 
 // ============================================================================
-// レート制限
+// レート制限（statusId 単位の管理）
 // ============================================================================
 
-function initRateLimit() {
-  const key = 'post_op_rate_limit_executions';
-  if (!sessionStorage.getItem(key)) {
-    sessionStorage.setItem(key, JSON.stringify([]));
-  }
+/**
+ * 指定 statusId の最後の成功実行時刻を記録
+ * @param {string} statusId - ポストID
+ */
+function recordRateLimitExecution(statusId) {
+  const key = `post_op_rate_limit_${statusId}`;
+  sessionStorage.setItem(key, Date.now().toString());
+  log(`[レート制限] 実行記録: ${statusId}`);
 }
 
-function checkRateLimit() {
-  const key = 'post_op_rate_limit_executions';
-  const now = Date.now();
-  let executions = JSON.parse(sessionStorage.getItem(key) || '[]');
+/**
+ * 指定 statusId のレート制限をチェック（cooldown 付き）
+ * 同一ポストに対し、RATE_LIMIT_WINDOW_SEC 秒以内の再実行はNG
+ * @param {string} statusId - ポストID
+ * @returns {boolean} 実行可能ならtrue、cooldown中ならfalse
+ */
+function checkRateLimitPerPost(statusId) {
+  const key = `post_op_rate_limit_${statusId}`;
+  const lastExecution = sessionStorage.getItem(key);
 
-  // 古いタイムスタンプを削除
-  executions = executions.filter(
-    ts => (now - ts) < CONFIG.RATE_LIMIT_WINDOW_SEC * 1000
-  );
-
-  const canExecute = executions.length < CONFIG.RATE_LIMIT_MAX_EXECUTIONS;
-
-  if (canExecute) {
-    executions.push(now);
-    sessionStorage.setItem(key, JSON.stringify(executions));
-    log(`レート制限: OK (${executions.length}/${CONFIG.RATE_LIMIT_MAX_EXECUTIONS})`);
-  } else {
-    log(`レート制限: NG (上限到達)`);
+  if (!lastExecution) {
+    log(`[レート制限] OK: ${statusId}（初回実行）`);
+    return true;
   }
 
-  return canExecute;
+  const now = Date.now();
+  const lastTime = parseInt(lastExecution, 10);
+  const elapsedSec = (now - lastTime) / 1000;
+
+  if (elapsedSec < CONFIG.RATE_LIMIT_WINDOW_SEC) {
+    log(`[レート制限] NG: ${statusId}（cooldown中: あと ${Math.ceil(CONFIG.RATE_LIMIT_WINDOW_SEC - elapsedSec)}秒）`);
+    return false;
+  }
+
+  log(`[レート制限] OK: ${statusId}（cooldown解除）`);
+  return true;
 }
 
 // ============================================================================
@@ -510,23 +518,33 @@ async function processPost() {
     return;
   }
 
-  // レート制限チェック
-  if (!checkRateLimit()) {
-    log('スキップ: レート制限');
-    return;
-  }
-
   // ポスト本文抽出
   const postContent = extractPostContent();
   if (!postContent) {
-    log('スキップ: ポスト本文取得失敗');
+    log('[スキップ] ポスト本文取得失敗');
     return;
   }
 
   // 実行するアクション判定
   const actionKey = shouldExecuteAction(postContent);
   if (!actionKey) {
-    log('スキップ: 実行するアクションなし');
+    log('[スキップ] 実行するアクションなし');
+    return;
+  }
+
+  // リポストボタン検出（これ以上進む前に確認）
+  const repostButton = document.querySelector('[aria-label*="リポスト"]') ||
+                       document.querySelector('[aria-label*="Retweet"]') ||
+                       document.querySelector('[data-testid="retweet"]');
+  if (!repostButton) {
+    log('[スキップ] リポストボタンが見つかりません');
+    return;
+  }
+  log('[検出] リポストボタンを検出');
+
+  // ★ ここまで来てから初めてレート制限をチェック ★
+  if (!checkRateLimitPerPost(statusId)) {
+    log('[スキップ] レート制限（cooldown中）');
     return;
   }
 
@@ -545,6 +563,8 @@ async function processPost() {
     if (success) {
       log('[完了] リポスト完了（処理済みをマーク）');
       // ※ executeAction() 内で markAsProcessed() 呼び出し済み
+      // ★ 成功時のみレート制限実行記録を残す ★
+      recordRateLimitExecution(statusId);
     } else {
       log('[失敗] アクション実行失敗（自動解除を実行）');
       unmarkAsProcessed(statusId);
@@ -560,26 +580,39 @@ async function processPost() {
 // ============================================================================
 
 function initMutationObserver() {
-  // ポスト本文DOが出現したことを検知
+  // statusId が変わった時のみ processPost() を呼ぶ（debounce 付き）
+  let lastStatusId = null;
   let processingInProgress = false;
+  let debounceTimer = null;
+
   const observer = new MutationObserver((mutations) => {
     // 既に処理中なら返す
     if (processingInProgress) return;
-    
+
     for (const mutation of mutations) {
       if (mutation.type === 'childList' || mutation.type === 'subtree') {
         const tweetText = document.querySelector('[data-testid="tweetText"]');
         if (tweetText) {
           // ポスト本文が表示された
-          const statusId = getCurrentStatusId();
-          if (statusId && !isAlreadyProcessed(statusId)) {
-            log('MutationObserver: ポスト本文検出');
-            processingInProgress = true;
-            processPost().catch(e => {
-              log('処理中エラー:', e.message);
-            }).finally(() => {
-              processingInProgress = false;
-            });
+          const currentStatusId = getCurrentStatusId();
+
+          // statusId が変わったか初回かチェック
+          if (currentStatusId && currentStatusId !== lastStatusId) {
+            lastStatusId = currentStatusId;
+            log('[監視] statusId 変更検知:', currentStatusId);
+
+            // debounce: 500ms 待機（連続 DOM 更新を吸収）
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+              if (!isAlreadyProcessed(currentStatusId)) {
+                processingInProgress = true;
+                processPost().catch(e => {
+                  log('[監視] 処理中エラー:', e.message);
+                }).finally(() => {
+                  processingInProgress = false;
+                });
+              }
+            }, 500);
           }
           break;
         }
@@ -629,9 +662,6 @@ function initHistoryHook() {
 function init() {
   log('スクリプト開始');
   log('現在のURL:', window.location.href);
-
-  // 初期化
-  initRateLimit();
 
   // 監視開始
   initMutationObserver();
@@ -684,9 +714,72 @@ function clearAllProcessedFlags() {
   alert(`${keysToRemove.length} 件の処理済みフラグをクリアしました`);
 }
 
+/**
+ * 指定ポストのレート制限（cooldown）をクリア
+ * @param {string} statusId - ポストID（省略時は現在のポスト）
+ */
+function clearRateLimitCooldown(statusId) {
+  if (!statusId) {
+    statusId = getCurrentStatusId();
+  }
+  if (statusId) {
+    const key = `post_op_rate_limit_${statusId}`;
+    sessionStorage.removeItem(key);
+    log(`[管理] レート制限クリア: ${statusId}`);
+    alert(`ポスト ${statusId} のレート制限をクリアしました`);
+  }
+}
+
+/**
+ * 全てのレート制限履歴をクリア
+ */
+function clearAllRateLimits() {
+  const keysToRemove = [];
+  for (let i = 0; i < sessionStorage.length; i++) {
+    const key = sessionStorage.key(i);
+    if (key && key.startsWith('post_op_rate_limit_')) {
+      keysToRemove.push(key);
+    }
+  }
+
+  keysToRemove.forEach(key => {
+    sessionStorage.removeItem(key);
+    const statusId = key.replace('post_op_rate_limit_', '');
+    log(`[管理] レート制限クリア: ${statusId}`);
+  });
+
+  alert(`${keysToRemove.length} 件のレート制限履歴をクリアしました`);
+}
+
 // スクリプト開始
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', init);
 } else {
   init();
+}
+
+// ============================================================================
+// Tampermonkey メニュー登録
+// ============================================================================
+
+try {
+  GM_registerMenuCommand('📋 [post_op] 現在のポスト: 処理済みを解除', () => {
+    clearProcessedFlag();
+  });
+
+  GM_registerMenuCommand('📋 [post_op] 全ポスト: 処理済みをクリア', () => {
+    clearAllProcessedFlags();
+  });
+
+  GM_registerMenuCommand('⏱️ [post_op] 現在のポスト: レート制限をクリア', () => {
+    clearRateLimitCooldown();
+  });
+
+  GM_registerMenuCommand('⏱️ [post_op] 全ポスト: レート制限をクリア', () => {
+    clearAllRateLimits();
+  });
+
+  log('[初期化] Tampermonkey メニュー登録完了');
+} catch (e) {
+  log('[初期化] Tampermonkey メニュー登録失敗:', e.message);
 }
